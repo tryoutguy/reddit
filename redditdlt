@@ -1,1 +1,1 @@
-git apply -- apply https://github.com/reddit/reddit/commit/734433664d580ee85b8732b8350d031a52580bb6.patch
+git apply --apply https://github.com/reddit/reddit/commit/734433664d580ee85b8732b8350d031a52580bb6.patch
