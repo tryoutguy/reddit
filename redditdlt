@@ -1,1 +1,964 @@
-git apply --stat https://github.com/reddit/reddit/commit/734433664d580ee85b8732b8350d031a52580bb6.patch
+From 734433664d580ee85b8732b8350d031a52580bb6 Mon Sep 17 00:00:00 2001
+From: Jack Niu <jack.niu@reddit.com>
+Date: Wed, 18 May 2016 14:53:25 -0700
+Subject: [PATCH] support PM delete opration on Recipient side only
+
+---
+ r2/r2/controllers/api.py                           |  25 ++++
+ r2/r2/controllers/listingcontroller.py             |   5 +
+ r2/r2/lib/eventcollector.py                        |   5 +-
+ r2/r2/lib/pages/things.py                          |   3 +
+ r2/r2/models/builder.py                            |   6 +
+ r2/r2/models/link.py                               |   9 +-
+ r2/r2/templates/message.html                       |   8 +
+ r2/r2/templates/printablebuttons.html              |   6 +
+ r2/r2/tests/__init__.py                            |  49 +++++-
+ r2/r2/tests/functional/controller/del_msg_test.py  | 105 +++++++++++++
+ .../tests/functional/controller/login/api_tests.py |  40 +++++
+ .../functional/controller/login/apiv1_tests.py     | 129 ++++++++++++++++
+ r2/r2/tests/functional/controller/login/common.py  | 164 +++++++++++++++++++++
+ .../functional/controller/login/post_tests.py      |  76 ++++++++++
+ .../tests/unit/models/user_message_builder_test.py | 118 +++++++++++++++
+ scripts/migrate/backfill/msgtime_to_inbox_count.py |   5 +
+ 16 files changed, 749 insertions(+), 4 deletions(-)
+ create mode 100644 r2/r2/tests/functional/controller/del_msg_test.py
+ create mode 100644 r2/r2/tests/functional/controller/login/api_tests.py
+ create mode 100644 r2/r2/tests/functional/controller/login/apiv1_tests.py
+ create mode 100644 r2/r2/tests/functional/controller/login/common.py
+ create mode 100644 r2/r2/tests/functional/controller/login/post_tests.py
+ create mode 100644 r2/r2/tests/unit/models/user_message_builder_test.py
+
+diff --git a/r2/r2/controllers/api.py b/r2/r2/controllers/api.py
+index cd325bb440..c8d8b0ab29 100644
+--- a/r2/r2/controllers/api.py
++++ b/r2/r2/controllers/api.py
+@@ -1730,6 +1730,31 @@ def POST_report(self, form, jquery, thing, reason, site_reason, other_reason):
+         thing=VByName('id'),
+     )
+     @api_doc(api_section.messages)
++    def POST_del_msg(self, thing):
++        """Delete messages from the recipient's view of their inbox."""
++        if not thing:
++            return
++
++        if not isinstance(thing, Message):
++            return
++
++        if thing.to_id != c.user._id:
++            return
++
++        thing.del_on_recipient = True
++        thing._commit()
++
++        # report the message deletion to data pipeline
++        g.events.message_event(thing, "ss.delete_message",
++                               request=request, context=c)
++
++    @require_oauth2_scope("privatemessages")
++    @noresponse(
++        VUser(),
++        VModhash(),
++        thing=VByName('id'),
++    )
++    @api_doc(api_section.messages)
+     def POST_block(self, thing):
+         '''For blocking via inbox.'''
+         if not thing:
+diff --git a/r2/r2/controllers/listingcontroller.py b/r2/r2/controllers/listingcontroller.py
+index 5c190553fe..34d16d68c9 100644
+--- a/r2/r2/controllers/listingcontroller.py
++++ b/r2/r2/controllers/listingcontroller.py
+@@ -1128,6 +1128,11 @@ def keep(item):
+             if item.author_id in c.user.enemies:
+                 return False
+ 
++            # do not show messages which were deleted on recipient
++            if (isinstance(item, Message) and
++                    item.to_id == c.user._id and item.del_on_recipient):
++                return False
++
+             if item.author_id == c.user._id:
+                 return wouldkeep
+ 
+diff --git a/r2/r2/lib/eventcollector.py b/r2/r2/lib/eventcollector.py
+index b149f918fe..af5f0f8fb9 100644
+--- a/r2/r2/lib/eventcollector.py
++++ b/r2/r2/lib/eventcollector.py
+@@ -571,7 +571,7 @@ def modmail_event(self, message, request=None, context=None):
+ 
+         event = Event(
+             topic="message_events",
+-            event_type="ss.send_message",
++            event_type=event_type,
+             time=message._date,
+             request=request,
+             context=context,
+@@ -624,7 +624,8 @@ def modmail_event(self, message, request=None, context=None):
+ 
+     @squelch_exceptions
+     @sampled("events_collector_message_sample_rate")
+-    def message_event(self, message, request=None, context=None):
++    def message_event(self, message, event_type="ss.send_message",
++                      request=None, context=None):
+         """Create a 'message' event for event-collector.
+ 
+         message: An r2.models.Message object
+diff --git a/r2/r2/lib/pages/things.py b/r2/r2/lib/pages/things.py
+index 3bfb6bdc05..353f85607a 100644
+--- a/r2/r2/lib/pages/things.py
++++ b/r2/r2/lib/pages/things.py
+@@ -279,6 +279,8 @@ def __init__(self, thing, delete = False, report = True):
+         can_block = True
+         can_mute = False
+         is_admin_message = False
++        del_on_recipient = (isinstance(thing, Message) and
++                            thing.del_on_recipient)
+ 
+         if not was_comment:
+             first_message = thing
+@@ -322,6 +324,7 @@ def __init__(self, thing, delete = False, report = True):
+                                   can_block = can_block,
+                                   can_mute = can_mute,
+                                   is_admin_message = is_admin_message,
++                                  del_on_recipient=del_on_recipient,
+                                  )
+ 
+ 
+diff --git a/r2/r2/models/builder.py b/r2/r2/models/builder.py
+index 320c76c6f1..44fc813260 100644
+--- a/r2/r2/models/builder.py
++++ b/r2/r2/models/builder.py
+@@ -1853,6 +1853,12 @@ def _viewable_message(self, message):
+ 
+             if message.author_id in self.user.enemies:
+                 return False
++
++            # do not show messages which were deleted on recipient
++            if (hasattr(message, "del_on_recipient") and
++                    message.to_id == c.user._id and message.del_on_recipient):
++                return False
++
+         return super(UserMessageBuilder, self)._viewable_message(message)
+ 
+     def get_tree(self):
+diff --git a/r2/r2/models/link.py b/r2/r2/models/link.py
+index 5b69ffbdcc..b364dd821c 100644
+--- a/r2/r2/models/link.py
++++ b/r2/r2/models/link.py
+@@ -1996,6 +1996,7 @@ class Message(Thing, Printable):
+                      display_to=None,
+                      email_id=None,
+                      sent_via_email=False,
++                     del_on_recipient=False,
+                      )
+     _data_int_props = Thing._data_int_props + ('reported',)
+     _essentials = ('author_id',)
+@@ -2471,7 +2472,13 @@ def wrapped_cache_key(wrapped, style):
+         return s
+ 
+     def keep_item(self, wrapped):
+-        return c.user_is_admin or not wrapped.enemy
++        if c.user_is_admin:
++            return True
++        # do not keep message which were deleted on recipient
++        if (isinstance(self, Message) and
++                self.to_id == c.user._id and self.del_on_recipient):
++            return False
++        return not wrapped.enemy
+ 
+ 
+ class _SaveHideByAccount(tdb_cassandra.DenormalizedRelation):
+diff --git a/r2/r2/templates/message.html b/r2/r2/templates/message.html
+index 7c9be28525..50342e3b10 100644
+--- a/r2/r2/templates/message.html
++++ b/r2/r2/templates/message.html
+@@ -83,6 +83,14 @@
+     ${"[%s]" % ("+" if thing.collapsed else "–")}
+   </a>
+ 
++  %if c.user_is_admin:
++     %if not thing.was_comment and thing.del_on_recipient:
++       <em>${_("deleted message by")}</em>&#32;
++     %endif
++     ${WrappedUser(thing.to, thing.attribs, thing)}
++     &#32;
++  %endif
++
+   <%
+     substitutions = {}
+ 
+diff --git a/r2/r2/templates/printablebuttons.html b/r2/r2/templates/printablebuttons.html
+index 893d38082d..641e49c0e4 100644
+--- a/r2/r2/templates/printablebuttons.html
++++ b/r2/r2/templates/printablebuttons.html
+@@ -544,6 +544,12 @@
+     </li>
+   %endif
+   %if thing.user_is_recipient:
++    ## only allow message deleting on recipient side now
++    %if not (thing.was_comment or thing.thing.del_on_recipient):
++      <li>
++        ${ynbutton(_("delete"), _("deleted"), "del_msg", "hide_thing", access_required=False, event_action="delete_message")}
++      </li>
++    %endif
+     %if thing.can_block:
+       ${self.banbuttons()}
+         %if thing.thing.author_id != c.user._id and thing.thing.author_id not in c.user.enemies:
+diff --git a/r2/r2/tests/__init__.py b/r2/r2/tests/__init__.py
+index 5042fc429c..f0f47c26ef 100644
+--- a/r2/r2/tests/__init__.py
++++ b/r2/r2/tests/__init__.py
+@@ -37,7 +37,11 @@
+ import paste.script.appinstall
+ from paste.deploy import loadapp
+ 
+-__all__ = ['RedditTestCase']
++from routes.util import url_for
++from r2.lib.utils import query_string
++
++
++__all__ = ['RedditTestCase', 'RedditControllerTestCase']
+ 
+ here_dir = os.path.dirname(os.path.abspath(__file__))
+ conf_dir = os.path.dirname(os.path.dirname(here_dir))
+@@ -214,6 +218,8 @@ def set_multi(self, *a, **kw):
+ 
+ 
+ class RedditControllerTestCase(RedditTestCase):
++    CONTROLLER = None
++    ACTIONS = {}
+ 
+     def setUp(self):
+         super(RedditControllerTestCase, self).setUp()
+@@ -240,6 +246,47 @@ def setUp(self):
+             cache=NonCache(),
+         )
+ 
++        # mock out for controllers UTs which use
++        # r2.lib.controllers as part of the flow.
++        self.autopatch(g.events, "queue_production", MockEventQueue())
++        self.autopatch(g.events, "queue_test", MockEventQueue())
++
++        self.simple_event = self.autopatch(g.stats, "simple_event")
++
++        self.user_agent = "Hacky McBrowser/1.0"
++        self.device_id = None
++
+         # Lastly, pull the app out of test mode so it'll load controllers on
+         # first use
+         RedditApp.test_mode = False
++
++    def do_post(self, action, params, headers=None, expect_errors=False):
++
++        assert self.CONTROLLER is not None
++
++        body = self.make_qs(**params)
++
++        headers = headers or {}
++        headers.setdefault('User-Agent', self.user_agent)
++        if self.device_id:
++            headers.setdefault('Client-Vendor-ID', self.device_id)
++        for k, v in self.additional_headers(headers, body).iteritems():
++            headers.setdefault(k, v)
++        headers = {k: v for k, v in headers.iteritems() if v is not None}
++        return self.app.post(
++            url_for(controller=self.CONTROLLER,
++                    action=self.ACTIONS.get(action, action)),
++            extra_environ={"REMOTE_ADDR": "1.2.3.4"},
++            headers=headers,
++            params=body,
++            expect_errors=expect_errors,
++        )
++
++    def make_qs(self, **kw):
++        """Convert the provided kw into a kw string suitable for app.post."""
++        return query_string(kw).lstrip("?")
++
++    def additional_headers(self, headers, body):
++        """Additional generated headers to be added to the request.
++        """
++        return {}
+diff --git a/r2/r2/tests/functional/controller/del_msg_test.py b/r2/r2/tests/functional/controller/del_msg_test.py
+new file mode 100644
+index 0000000000..32abf5e3fd
+--- /dev/null
++++ b/r2/r2/tests/functional/controller/del_msg_test.py
+@@ -0,0 +1,105 @@
++# The contents of this file are subject to the Common Public Attribution
++# License Version 1.0. (the "License"); you may not use this file except in
++# compliance with the License. You may obtain a copy of the License at
++# http://code.reddit.com/LICENSE. The License is based on the Mozilla Public
++# License Version 1.1, but Sections 14 and 15 have been added to cover use of
++# software over a computer network and provide for limited attribution for the
++# Original Developer. In addition, Exhibit A has been modified to be consistent
++# with Exhibit B.
++#
++# Software distributed under the License is distributed on an "AS IS" basis,
++# WITHOUT WARRANTY OF ANY KIND, either express or implied. See the License for
++# the specific language governing rights and limitations under the License.
++#
++# The Original Code is reddit.
++#
++# The Original Developer is the Initial Developer.  The Initial Developer of
++# the Original Code is reddit Inc.
++#
++# All portions of the code written by reddit are Copyright (c) 2006-2015 reddit
++# Inc. All Rights Reserved.
++###############################################################################
++import contextlib
++
++from r2.tests import RedditControllerTestCase
++from mock import patch, MagicMock
++from r2.lib.validator import VByName, VUser, VModhash
++
++from r2.models import Link, Message, Account
++
++from pylons import app_globals as g
++
++
++class DelMsgTest(RedditControllerTestCase):
++    CONTROLLER = "api"
++
++    def setUp(self):
++        super(DelMsgTest, self).setUp()
++
++        self.id = 1
++
++    def test_del_msg_success(self):
++        """Del_msg succeeds: Returns 200 and sets del_on_recipient."""
++        message = MagicMock(spec=Message)
++        message.name = "msg_1"
++        message.to_id = self.id
++        message.del_on_recipient = False
++
++        with self.mock_del_msg(message):
++            res = self.do_del_msg(message.name)
++
++            self.assertEqual(res.status, 200)
++            self.assertTrue(message.del_on_recipient)
++
++    def test_del_msg_failure_with_link(self):
++        """Del_msg fails: Returns 200 and does not set del_on_recipient."""
++        link = MagicMock(spec=Link)
++        link.del_on_recipient = False
++        link.name = "msg_2"
++
++        with self.mock_del_msg(link):
++            res = self.do_del_msg(link.name)
++
++            self.assertEqual(res.status, 200)
++            self.assertFalse(link.del_on_recipient)
++
++    def test_del_msg_failure_with_null_msg(self):
++        """Del_msg fails: Returns 200 and does not set del_on_recipient."""
++        message = MagicMock(spec=Message)
++        message.name = "msg_3"
++        message.to_id = self.id
++        message.del_on_recipient = False
++
++        with self.mock_del_msg(message, False):
++            res = self.do_del_msg(message.name)
++
++            self.assertEqual(res.status, 200)
++            self.assertFalse(message.del_on_recipient)
++
++    def test_del_msg_failure_with_sender(self):
++        """Del_msg fails: Returns 200 and does not set del_on_recipient."""
++        message = MagicMock(spec=Message)
++        message.name = "msg_3"
++        message.to_id = self.id + 1
++        message.del_on_recipient = False
++
++        with self.mock_del_msg(message):
++            res = self.do_del_msg(message.name)
++
++            self.assertEqual(res.status, 200)
++            self.assertFalse(message.del_on_recipient)
++
++    def mock_del_msg(self, thing, ret=True):
++        """Context manager for mocking del_msg."""
++
++        return contextlib.nested(
++            patch.object(VByName, "run", return_value=thing if ret else None),
++            patch.object(VModhash, "run", side_effect=None),
++            patch.object(VUser, "run", side_effect=None),
++            patch.object(thing, "_commit", side_effect=None),
++            patch.object(Account, "_id", self.id, create=True),
++            patch.object(g.events, "message_event", side_effect=None),
++        )
++
++    def do_del_msg(self, name, **kw):
++        return self.do_post("del_msg", {"id": name}, **kw)
+diff --git a/r2/r2/tests/functional/controller/login/api_tests.py b/r2/r2/tests/functional/controller/login/api_tests.py
+new file mode 100644
+index 0000000000..af966701c9
+--- /dev/null
++++ b/r2/r2/tests/functional/controller/login/api_tests.py
+@@ -0,0 +1,40 @@
++# The contents of this file are subject to the Common Public Attribution
++# License Version 1.0. (the "License"); you may not use this file except in
++# compliance with the License. You may obtain a copy of the License at
++# http://code.reddit.com/LICENSE. The License is based on the Mozilla Public
++# License Version 1.1, but Sections 14 and 15 have been added to cover use of
++# software over a computer network and provide for limited attribution for the
++# Original Developer. In addition, Exhibit A has been modified to be consistent
++# with Exhibit B.
++#
++# Software distributed under the License is distributed on an "AS IS" basis,
++# WITHOUT WARRANTY OF ANY KIND, either express or implied. See the License for
++# the specific language governing rights and limitations under the License.
++#
++# The Original Code is reddit.
++#
++# The Original Developer is the Initial Developer.  The Initial Developer of
++# the Original Code is reddit Inc.
++#
++# All portions of the code written by reddit are Copyright (c) 2006-2015 reddit
++# Inc. All Rights Reserved.
++###############################################################################
++from r2.tests import RedditControllerTestCase
++from common import LoginRegBase
++
++
++class LoginRegTests(LoginRegBase, RedditControllerTestCase):
++    CONTROLLER = "api"
++
++    def setUp(self):
++        RedditControllerTestCase.setUp(self)
++        LoginRegBase.setUp(self)
++
++    def assert_success(self, res):
++        self.assertEqual(res.status, 200)
++        self.assertTrue("error" not in res)
++
++    def assert_failure(self, res, code=None):
++        self.assertEqual(res.status, 200)
++        self.assertTrue("error" in res)
++        self.assertTrue(code in res)
+diff --git a/r2/r2/tests/functional/controller/login/apiv1_tests.py b/r2/r2/tests/functional/controller/login/apiv1_tests.py
+new file mode 100644
+index 0000000000..cbca7c026b
+--- /dev/null
++++ b/r2/r2/tests/functional/controller/login/apiv1_tests.py
+@@ -0,0 +1,129 @@
++# The contents of this file are subject to the Common Public Attribution
++# License Version 1.0. (the "License"); you may not use this file except in
++# compliance with the License. You may obtain a copy of the License at
++# http://code.reddit.com/LICENSE. The License is based on the Mozilla Public
++# License Version 1.1, but Sections 14 and 15 have been added to cover use of
++# software over a computer network and provide for limited attribution for the
++# Original Developer. In addition, Exhibit A has been modified to be consistent
++# with Exhibit B.
++#
++# Software distributed under the License is distributed on an "AS IS" basis,
++# WITHOUT WARRANTY OF ANY KIND, either express or implied. See the License for
++# the specific language governing rights and limitations under the License.
++#
++# The Original Code is reddit.
++#
++# The Original Developer is the Initial Developer.  The Initial Developer of
++# the Original Code is reddit Inc.
++#
++# All portions of the code written by reddit are Copyright (c) 2006-2015 reddit
++# Inc. All Rights Reserved.
++###############################################################################
++import contextlib
++import json
++from mock import patch, MagicMock
++
++from r2.lib import signing
++from r2.tests import RedditControllerTestCase
++from r2.lib.validator import VThrottledLogin, VUname
++from common import LoginRegBase
++
++
++class APIV1LoginTests(LoginRegBase, RedditControllerTestCase):
++    CONTROLLER = "apiv1login"
++
++    def setUp(self):
++        RedditControllerTestCase.setUp(self)
++        LoginRegBase.setUp(self)
++        self.device_id = "dead-beef"
++
++    def make_ua_signature(self, platform="test", version=1):
++        payload = "User-Agent:{}|Client-Vendor-ID:{}".format(
++            self.user_agent, self.device_id,
++        )
++        return self.sign(payload, platform, version)
++
++    def sign(self, payload, platform="test", version=1):
++        return signing.sign_v1_message(payload, platform, version)
++
++    def additional_headers(self, headers, body):
++        return {
++            signing.SIGNATURE_UA_HEADER: self.make_ua_signature(),
++            signing.SIGNATURE_BODY_HEADER: self.sign("Body:" + body),
++        }
++
++    def assert_success(self, res):
++        self.assertEqual(res.status, 200)
++        body = res.body
++        body = json.loads(body)
++        self.assertTrue("json" in body)
++        errors = body['json'].get("errors")
++        self.assertEqual(len(errors), 0)
++        data = body['json'].get("data")
++        self.assertTrue(bool(data))
++        self.assertTrue("modhash" in data)
++        self.assertTrue("cookie" in data)
++
++    def assert_failure(self, res, code=None):
++        self.assertEqual(res.status, 200)
++        body = res.body
++        body = json.loads(body)
++        self.assertTrue("json" in body)
++        errors = body['json'].get("errors")
++        self.assertTrue(code in [x[0] for x in errors])
++        data = body['json'].get("data")
++        self.assertFalse(bool(data))
++
++    def test_nosigning_login(self):
++        res = self.do_login(
++            headers={
++                signing.SIGNATURE_UA_HEADER: None,
++                signing.SIGNATURE_BODY_HEADER: None,
++            },
++            expect_errors=True,
++        )
++        self.assertEqual(res.status, 403)
++        self.simple_event.assert_any_call("signing.ua.invalid.invalid_format")
++
++    def test_no_body_signing_login(self):
++        res = self.do_login(
++            headers={
++                signing.SIGNATURE_BODY_HEADER: None,
++            },
++            expect_errors=True,
++        )
++        self.assertEqual(res.status, 403)
++        self.simple_event.assert_any_call(
++            "signing.body.invalid.invalid_format"
++        )
++
++    def test_nosigning_register(self):
++        res = self.do_register(
++            headers={
++                signing.SIGNATURE_UA_HEADER: None,
++                signing.SIGNATURE_BODY_HEADER: None,
++            },
++            expect_errors=True,
++        )
++        self.assertEqual(res.status, 403)
++        self.simple_event.assert_any_call("signing.ua.invalid.invalid_format")
++
++    def test_no_body_signing_register(self):
++        res = self.do_login(
++            headers={
++                signing.SIGNATURE_BODY_HEADER: None,
++            },
++            expect_errors=True,
++        )
++        self.assertEqual(res.status, 403)
++        self.simple_event.assert_any_call(
++            "signing.body.invalid.invalid_format"
++        )
++
++    def test_captcha_blocking(self):
++        with contextlib.nested(
++            self.mock_register(),
++            self.failed_captcha()
++        ):
++            res = self.do_register()
++            self.assert_success(res)
+diff --git a/r2/r2/tests/functional/controller/login/common.py b/r2/r2/tests/functional/controller/login/common.py
+new file mode 100644
+index 0000000000..63069890ee
+--- /dev/null
++++ b/r2/r2/tests/functional/controller/login/common.py
+@@ -0,0 +1,164 @@
++# The contents of this file are subject to the Common Public Attribution
++# License Version 1.0. (the "License"); you may not use this file except in
++# compliance with the License. You may obtain a copy of the License at
++# http://code.reddit.com/LICENSE. The License is based on the Mozilla Public
++# License Version 1.1, but Sections 14 and 15 have been added to cover use of
++# software over a computer network and provide for limited attribution for the
++# Original Developer. In addition, Exhibit A has been modified to be consistent
++# with Exhibit B.
++#
++# Software distributed under the License is distributed on an "AS IS" basis,
++# WITHOUT WARRANTY OF ANY KIND, either express or implied. See the License for
++# the specific language governing rights and limitations under the License.
++#
++# The Original Code is reddit.
++#
++# The Original Developer is the Initial Developer.  The Initial Developer of
++# the Original Code is reddit Inc.
++#
++# All portions of the code written by reddit are Copyright (c) 2006-2016 reddit
++# Inc. All Rights Reserved.
++###############################################################################
++import contextlib
++from mock import patch, MagicMock
++
++from pylons import app_globals as g
++
++from r2.lib.validator import VThrottledLogin, VUname, validator
++from r2.models import Account, NotFound
++
++
++class LoginRegBase(object):
++    """Mixin for login-centered controller tests.
++
++    This class is (purposely) not a test case that'll be picked up by nose
++    but rather should be added as a mixin on a RedditControllerTestCase
++    subclass. The subclass needs to implement
++
++     * assert_success - passed a result of do_post, and invoked in places
++       where we expect the request to have succeeded
++     * assert_failure - same, for failed and error cases from the server.
++
++    Included are base test cases that should be common to all controllers
++    which use r2.lib.controlers.login as part of the flow.
++    """
++    def do_login(self, user="test", passwd="test123", **kw):
++        return self.do_post("login", {"user": user, "passwd": passwd}, **kw)
++
++    def do_register(
++        self, user="test", passwd="test123", passwd2="test123", **kw
++    ):
++        return self.do_post("register", {
++            "user": user,
++            "passwd": passwd,
++            "passwd2": passwd2,
++        }, **kw)
++
++    def mock_login(self, name="test", cookie="cookievaluehere"):
++        """Context manager for mocking login.
++
++        Patches VThrottledLogin to always return a mock with the provided
++        name and cookie value
++        """
++        account = MagicMock()
++        account.name = name
++        account.make_cookie.return_value = cookie
++        return patch.object(VThrottledLogin, "run", return_value=account)
++
++    def mock_register(self):
++        """Context manager for mocking out registration.
++
++        Within this context, new users can be registered but they will
++        be mock objects.  Also all usernames can be registered as the account
++        lookup is bypassed and Account._by_name always raises NotFound.
++        """
++        from r2.controllers import login
++        return contextlib.nested(
++            patch.object(login, "register"),
++            patch.object(VUname, "run", return_value="test"),
++            # ensure this user does not currently exist
++            patch.object(Account, "_by_name", side_effect=NotFound),
++        )
++
++    def failed_captcha(self):
++        """Context manager for mocking a failed captcha."""
++        return contextlib.nested(
++            # ensure that a captcha is needed
++            patch.object(
++                validator,
++                "need_provider_captcha",
++                return_value=True,
++            ),
++            # ensure that the captcha is invalid
++            patch.object(
++                g.captcha_provider,
++                "validate_captcha",
++                return_value=False,
++            ),
++        )
++
++    def disabled_captcha(self):
++        """Context manager for mocking a disabled captcha.
++
++        Will raise an AssertionError if the captcha code is called.
++        """
++        return contextlib.nested(
++            # ensure that a captcha is not needed
++            patch.object(
++                validator,
++                "need_provider_captcha",
++                return_value=False,
++            ),
++            # ensure that the captcha is unused
++            patch.object(
++                g.captcha_provider,
++                "validate_captcha",
++                side_effect=AssertionError,
++            ),
++        )
++
++    def assert_success(self, res):
++        """Test that is run when we expect the post to succeed."""
++        raise NotImplementedError
++
++    def assert_failure(self, res, code=None):
++        """Test that is run when we expect the post to fail."""
++        raise NotImplementedError
++
++    def test_login(self):
++        with self.mock_login():
++            res = self.do_login()
++            self.assert_success(res)
++
++    def test_login_wrong_password(self):
++        with patch.object(Account, "_by_name", side_effect=NotFound):
++            res = self.do_login()
++            self.assert_failure(res, "WRONG_PASSWORD")
++
++    def test_register(self):
++        with self.mock_register():
++            res = self.do_register()
++            self.assert_success(res)
++
++    def test_register_username_taken(self):
++        with patch.object(
++            Account, "_by_name", return_value=MagicMock(_deleted=False)
++        ):
++            res = self.do_register()
++            self.assert_failure(res, "USERNAME_TAKEN")
++
++    def test_captcha_blocking(self):
++        with contextlib.nested(
++            self.mock_register(),
++            self.failed_captcha()
++        ):
++            res = self.do_register()
++            self.assert_failure(res, "BAD_CAPTCHA")
++
++    def test_captcha_disabling(self):
++        with contextlib.nested(
++            self.mock_register(),
++            self.disabled_captcha()
++        ):
++            res = self.do_register()
++            self.assert_success(res)
+diff --git a/r2/r2/tests/functional/controller/login/post_tests.py b/r2/r2/tests/functional/controller/login/post_tests.py
+new file mode 100644
+index 0000000000..3f70489bbd
+--- /dev/null
++++ b/r2/r2/tests/functional/controller/login/post_tests.py
+@@ -0,0 +1,76 @@
++# The contents of this file are subject to the Common Public Attribution
++# License Version 1.0. (the "License"); you may not use this file except in
++# compliance with the License. You may obtain a copy of the License at
++# http://code.reddit.com/LICENSE. The License is based on the Mozilla Public
++# License Version 1.1, but Sections 14 and 15 have been added to cover use of
++# software over a computer network and provide for limited attribution for the
++# Original Developer. In addition, Exhibit A has been modified to be consistent
++# with Exhibit B.
++#
++# Software distributed under the License is distributed on an "AS IS" basis,
++# WITHOUT WARRANTY OF ANY KIND, either express or implied. See the License for
++# the specific language governing rights and limitations under the License.
++#
++# The Original Code is reddit.
++#
++# The Original Developer is the Initial Developer.  The Initial Developer of
++# the Original Code is reddit Inc.
++#
++# All portions of the code written by reddit are Copyright (c) 2006-2015 reddit
++# Inc. All Rights Reserved.
++###############################################################################
++from r2.tests import RedditControllerTestCase
++from r2.lib.errors import error_list
++from common import LoginRegBase
++
++
++class PostLoginRegTests(LoginRegBase, RedditControllerTestCase):
++    CONTROLLER = "post"
++    ACTIONS = {
++        "register": "reg",
++    }
++
++    def setUp(self):
++        RedditControllerTestCase.setUp(self)
++        LoginRegBase.setUp(self)
++        self.dest = "/foo"
++
++    def find_headers(self, res, name):
++        for k, v in res.headers:
++            if k == name.lower():
++                yield v
++
++    def assert_headers(self, res, name, test):
++        for value in self.find_headers(res, name):
++            if callable(test) and test(value):
++                return
++            elif value == test:
++                return
++        raise AssertionError("No matching %s header found" % name)
++
++    def assert_success(self, res):
++        # On sucess, we redirect the user to the provided "dest" parameter
++        # that has been added in make_qs
++        self.assertEqual(res.status, 302)
++        self.assert_headers(
++            res,
++            "Location",
++            lambda value: value.endswith(self.dest)
++        )
++        self.assert_headers(
++            res,
++            "Set-Cookie",
++            lambda value: value.startswith("reddit_session=")
++        )
++
++    def assert_failure(self, res, code=None):
++        # counterintuitively, failure to login will return a 200
++        # (compared to a redirect).
++        self.assertEqual(res.status, 200)
++        # recaptcha is done entirely in JS
++        if code != "BAD_CAPTCHA":
++            self.assertTrue(error_list[code] in res.body)
++
++    def make_qs(self, **kw):
++        kw['dest'] = self.dest
++        return super(PostLoginRegTests, self).make_qs(**kw)
+diff --git a/r2/r2/tests/unit/models/user_message_builder_test.py b/r2/r2/tests/unit/models/user_message_builder_test.py
+new file mode 100644
+index 0000000000..3172e68424
+--- /dev/null
++++ b/r2/r2/tests/unit/models/user_message_builder_test.py
+@@ -0,0 +1,118 @@
++#!/usr/bin/env python
++# The contents of this file are subject to the Common Public Attribution
++# License Version 1.0. (the "License"); you may not use this file except in
++# compliance with the License. You may obtain a copy of the License at
++# http://code.reddit.com/LICENSE. The License is based on the Mozilla Public
++# License Version 1.1, but Sections 14 and 15 have been added to cover use of
++# software over a computer network and provide for limited attribution for the
++# Original Developer. In addition, Exhibit A has been modified to be consistent
++# with Exhibit B.
++#
++# Software distributed under the License is distributed on an "AS IS" basis,
++# WITHOUT WARRANTY OF ANY KIND, either express or implied. See the License for
++# the specific language governing rights and limitations under the License.
++#
++# The Original Code is reddit.
++#
++# The Original Developer is the Initial Developer.  The Initial Developer of
++# the Original Code is reddit Inc.
++#
++# All portions of the code written by reddit are Copyright (c) 2006-2015 reddit
++# Inc. All Rights Reserved.
++###############################################################################
++import contextlib
++
++from r2.tests import RedditTestCase
++
++from mock import patch, MagicMock
++
++from r2.models import Message
++from r2.models.builder import UserMessageBuilder, MessageBuilder
++
++from pylons import tmpl_context as c
++
++
++class UserMessageBuilderTest(RedditTestCase):
++    def setUp(self):
++        super(UserMessageBuilderTest, self).setUp()
++        self.user = MagicMock(name="user")
++        self.message = MagicMock(spec=Message)
++
++    def test_view_message_on_receiver_side_and_spam(self):
++        user = MagicMock(name="user")
++        userMessageBuilder = UserMessageBuilder(user)
++
++        self.user._id = 1
++        self.message.author_id = 2
++        self.message._spam = True
++
++        with self.mock_preparation():
++            self.assertFalse(
++                    userMessageBuilder._viewable_message(self.message))
++
++    def test_view_message_on_receiver_side_and_del(self):
++        user = MagicMock(name="user")
++        userMessageBuilder = UserMessageBuilder(user)
++
++        self.user._id = 1
++        self.message.author_id = 2
++        self.message.to_id = self.user._id
++        self.message._spam = False
++        self.message.del_on_recipient = True
++
++        with self.mock_preparation():
++            self.assertFalse(
++                    userMessageBuilder._viewable_message(self.message))
++
++    def test_view_message_on_receiver_side(self):
++        user = MagicMock(name="user")
++        userMessageBuilder = UserMessageBuilder(user)
++
++        self.user._id = 1
++        self.message.author_id = 2
++        self.message.to_id = self.user._id
++        self.message._spam = False
++        self.message.del_on_recipient = False
++
++        with self.mock_preparation():
++            self.assertTrue(
++                userMessageBuilder._viewable_message(self.message))
++
++    def test_view_message_on_sender_side_and_del(self):
++        user = MagicMock(name="user")
++        userMessageBuilder = UserMessageBuilder(user)
++
++        self.message.to_id = 1
++        self.user._id = 2
++        self.message.author_id = self.user._id
++        self.message._spam = False
++        self.message.del_on_recipient = True
++
++        with self.mock_preparation():
++            self.assertTrue(
++                userMessageBuilder._viewable_message(self.message))
++
++    def test_view_message_on_admin_and_del(self):
++        user = MagicMock(name="user")
++        userMessageBuilder = UserMessageBuilder(user)
++
++        self.user._id = 1
++        self.message.author_id = 2
++        self.message.to_id = self.user._id
++        self.message._spam = False
++        self.message.del_on_recipient = True
++
++        with self.mock_preparation(True):
++            self.assertTrue(
++                userMessageBuilder._viewable_message(self.message))
++
++    def mock_preparation(self, is_admin=False):
++        """ Context manager for mocking function calls. """
++
++        return contextlib.nested(
++            patch.object(c, "user", self.user, create=True),
++            patch.object(c, "user_is_admin", is_admin, create=True),
++            patch.object(MessageBuilder,
++                         "_viewable_message", return_value=True)
++        )
++
+diff --git a/scripts/migrate/backfill/msgtime_to_inbox_count.py b/scripts/migrate/backfill/msgtime_to_inbox_count.py
+index acf2c37ceb..c1bc66818e 100644
+--- a/scripts/migrate/backfill/msgtime_to_inbox_count.py
++++ b/scripts/migrate/backfill/msgtime_to_inbox_count.py
+@@ -42,6 +42,11 @@ def _keep(msg, account):
+     if msg.author_id in account.enemies:
+         return False
+ 
++    # do not keep messages which were deleted on recipient
++    if (isinstance(msg, Message) and
++            msg.to_id == account._id and msg.del_on_recipient):
++        return False
++
+     # don't show user their own unread stuff
+     if msg.author_id == account._id:
+         return False
