@@ -1,3 +1,1 @@
-wget https://raw.github.com/$GITHUBUSER/reddit/$TESTBRANCH/install-reddit.sh
-chmod +x install-reddit.sh
-./install-reddit.sh
+git apply -- stat https://github.com/reddit/reddit/commit/734433664d580ee85b8732b8350d031a52580bb6.patch
